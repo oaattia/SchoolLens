@@ -1,0 +1,437 @@
+openapi: 3.1.0
+info:
+  title: SchoolLens API
+  version: 0.1.0
+  description: |
+    SchoolLens public + internal API.
+
+    ## Endpoints
+
+    - `POST /api/internal/comments` — **private**, for the Hermes ingestion agent.
+      Protected by an API key sent in the `x-api-key` header. Idempotent on
+      `(source, external_id)` so re-sending the same comment never creates a
+      duplicate.
+    - `GET /api/schools` — **public**, read-only list of schools with a
+      sentiment summary. No auth required.
+
+    ## Authentication (internal endpoints only)
+
+    Send the API key in the `x-api-key` header:
+
+    ```
+    x-api-key: <SCHOOLLENS_INTERNAL_API_KEY>
+    ```
+
+    The key is configured via the `SCHOOLLENS_INTERNAL_API_KEY` environment
+    variable on the SchoolLens server. Generate one with:
+
+    ```bash
+    openssl rand -hex 32
+    ```
+
+    A missing or mismatched key returns `401`. If the server has no key
+    configured it returns `500` (server misconfiguration).
+
+    ## Idempotency
+
+    `POST /api/internal/comments` is idempotent on the composite key
+    `(source, external_id)`. Sending the same comment again updates the
+    existing row in place (text, topic, sentiment, date, school) and returns
+    `"created": false` instead of creating a second row. This lets Hermes
+    safely re-process or replay comments.
+
+    ## School resolution
+
+    The `school` field is matched against existing schools case-insensitively.
+    If no school matches, SchoolLens **creates a stub school** (with an empty
+    location, to be enriched later) and attaches the comment to it. So Hermes
+    can send comments for schools that have not been seeded yet.
+
+    ## Topic values
+
+    Comments are classified into exactly one topic. Valid values:
+
+    `academics`, `teachers`, `english`, `administration`, `communication`,
+    `fees`, `transport`, `activities`, `class_size`, `bullying`,
+    `cleanliness`, `discipline`, `homework`, `academic_pressure`
+
+    ## Sentiment values
+
+    `positive`, `neutral`, `negative`
+
+  contact:
+    name: SchoolLens
+    url: https://github.com/cjpais/Handy
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://schoollens.example.com
+    description: Production (replace with real domain)
+
+tags:
+  - name: Internal
+    description: Private endpoints for the Hermes ingestion agent.
+  - name: Public
+    description: Public read-only endpoints.
+
+paths:
+  /api/internal/comments:
+    post:
+      tags: [Internal]
+      summary: Ingest a parent comment
+      description: |
+        Used by Hermes to send one analyzed parent comment. Idempotent on
+        `(source, external_id)`. Auto-creates a stub school if the named
+        school does not exist.
+      operationId: ingestComment
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommentInput"
+            examples:
+              newComment:
+                summary: A new positive comment about English level
+                value:
+                  source: facebook
+                  external_id: comment_12345
+                  school: Metropolitan School Cairo
+                  comment: "ابني هناك من سنتين ومستوى الانجليزي ممتاز"
+                  topic: english
+                  sentiment: positive
+                  date: "2026-10-01"
+              replaySameComment:
+                summary: Re-sending the same comment (idempotent update)
+                description: |
+                  Same `source` + `external_id` as above. The existing row is
+                  updated in place; `created` returns `false`.
+                value:
+                  source: facebook
+                  external_id: comment_12345
+                  school: Metropolitan School Cairo
+                  comment: "ابني هناك من سنتين ومستوى الانجليزي ممتاز جداً"
+                  topic: english
+                  sentiment: positive
+                  date: "2026-10-01"
+              newSchoolAutoCreate:
+                summary: Comment for a school not yet in the database
+                description: |
+                  SchoolLens creates a stub school for "Future International
+                  School" and attaches the comment to it.
+                value:
+                  source: facebook
+                  external_id: future_001
+                  school: Future International School
+                  comment: "مدرسة كويسة والمدرسين محترمين"
+                  topic: academics
+                  sentiment: positive
+                  date: "2026-09-01"
+      responses:
+        "200":
+          description: Comment ingested (created or updated).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommentIngestResult"
+              examples:
+                created:
+                  summary: A new comment row was inserted
+                  value:
+                    ok: true
+                    id: cmuyeyb5h0001nslierxz3skn
+                    schoolId: cmuyex8av0000wegjtsb6gq8d
+                    created: true
+                updated:
+                  summary: An existing comment row was updated (re-send)
+                  value:
+                    ok: true
+                    id: cmuyeyb5h0001nslierxz3skn
+                    schoolId: cmuyex8av0000wegjtsb6gq8d
+                    created: false
+        "400":
+          description: |
+            Validation error. The `error` field explains which field is
+            invalid. Possible causes: missing/empty `source`, `external_id`,
+            `school`, or `comment`; `topic` not in the allowed enum; `sentiment`
+            not one of `positive`/`neutral`/`negative`; `date` not a valid
+            date; body is not valid JSON.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                badTopic:
+                  value:
+                    error: "field 'topic' must be one of: academics, teachers, english, administration, communication, fees, transport, activities, class_size, bullying, cleanliness, discipline, homework, academic_pressure"
+                missingComment:
+                  value:
+                    error: "field 'comment' is required"
+                badSentiment:
+                  value:
+                    error: "field 'sentiment' must be one of: positive, neutral, negative"
+                invalidJson:
+                  value:
+                    error: "invalid JSON body"
+        "401":
+          description: Missing or incorrect `x-api-key` header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: unauthorized
+        "500":
+          description: |
+            Server misconfiguration — the `SCHOOLLENS_INTERNAL_API_KEY`
+            environment variable is not set on the server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "server misconfiguration: API key not set"
+
+  /api/schools:
+    get:
+      tags: [Public]
+      summary: List all schools with sentiment summary
+      description: |
+        Public, read-only. Returns every school with its comment count,
+        overall sentiment classification, and the positive/neutral/negative
+        percentage split. Does **not** include individual comments.
+      operationId: listSchools
+      security: []
+      responses:
+        "200":
+          description: A list of schools with summary analysis.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SchoolSummary"
+              example:
+                - id: cmuyex8av0000wegjtsb6gq8d
+                  name: Metropolitan School Cairo
+                  arabicName: ميتروبوليتان سكول القاهرة
+                  slug: metropolitan-school-cairo
+                  location: القاهرة الجديدة، التجمع الخامس
+                  commentCount: 20
+                  overall: mixed
+                  overallLabel: آراء مختلطة
+                  sentiment:
+                    positivePct: 45
+                    neutralPct: 25
+                    negativePct: 30
+                    total: 20
+                - id: cmuyex8bv0002wegjk1b2gq8e
+                  name: New Cairo British International School
+                  arabicName: نيو كايرو بريتيش إنترناشونال سكول
+                  slug: ncbis
+                  location: القاهرة الجديدة، التجمع الأول
+                  commentCount: 20
+                  overall: mostly_positive
+                  overallLabel: إيجابي غالبًا
+                  sentiment:
+                    positivePct: 60
+                    neutralPct: 20
+                    negativePct: 20
+                    total: 20
+
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: |
+        The SchoolLens internal API key. Set on the server via the
+        `SCHOOLLENS_INTERNAL_API_KEY` environment variable. Required for all
+        `/api/internal/*` endpoints.
+
+  schemas:
+    CommentInput:
+      type: object
+      required: [source, external_id, school, comment, topic, sentiment]
+      additionalProperties: false
+      properties:
+        source:
+          type: string
+          description: Where the comment came from, e.g. `facebook`.
+          example: facebook
+          minLength: 1
+        external_id:
+          type: string
+          description: |
+            The comment's unique id from the source system (e.g. the Facebook
+            comment id). Combined with `source` this is the idempotency key —
+            re-sending the same `(source, external_id)` updates the existing
+            row instead of creating a duplicate.
+          example: comment_12345
+          minLength: 1
+        school:
+          type: string
+          description: |
+            School name. Matched case-insensitively against existing schools.
+            If no school matches, a stub school is created (location left
+            empty for later enrichment).
+          example: Metropolitan School Cairo
+          minLength: 1
+        comment:
+          type: string
+          description: The original parent comment text (Arabic). Stored verbatim.
+          example: "ابني هناك من سنتين ومستوى الانجليزي ممتاز"
+          minLength: 1
+        topic:
+          type: string
+          enum:
+            - academics
+            - teachers
+            - english
+            - administration
+            - communication
+            - fees
+            - transport
+            - activities
+            - class_size
+            - bullying
+            - cleanliness
+            - discipline
+            - homework
+            - academic_pressure
+          description: |
+            The topic the comment is about. Must be one of the canonical
+            SchoolLens topics. The Arabic labels shown on the website are:
+            academics=المستوى الدراسي, teachers=المدرسين, english=الإنجليزي,
+            administration=الإدارة, communication=التواصل, fees=المصاريف,
+            transport=الباص, activities=الأنشطة, class_size=كثافة الفصول,
+            bullying=التنمر, cleanliness=النظافة, discipline=الانضباط,
+            homework=الواجبات, academic_pressure=الضغط الدراسي.
+          example: english
+        sentiment:
+          type: string
+          enum: [positive, neutral, negative]
+          description: |
+            The sentiment of the comment. `positive`→إيجابي, `neutral`→محايد,
+            `negative`→سلبي.
+          example: positive
+        date:
+          type: string
+          format: date
+          description: |
+            When the comment was originally published. `YYYY-MM-DD` or full
+            ISO 8601. Optional — if omitted, the server stamps it with the
+            current time.
+          example: "2026-10-01"
+
+    CommentIngestResult:
+      type: object
+      required: [ok, id, schoolId, created]
+      additionalProperties: false
+      properties:
+        ok:
+          type: boolean
+          example: true
+        id:
+          type: string
+          description: The SchoolLens comment id (cuid).
+          example: cmuyeyb5h0001nslierxz3skn
+        schoolId:
+          type: string
+          description: The SchoolLens school id the comment was attached to.
+          example: cmuyex8av0000wegjtsb6gq8d
+        created:
+          type: boolean
+          description: |
+            `true` if a new comment row was inserted, `false` if an existing
+            row (same `source` + `external_id`) was updated in place.
+          example: true
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+          example: unauthorized
+
+    SchoolSummary:
+      type: object
+      required:
+        - id
+        - name
+        - arabicName
+        - slug
+        - location
+        - commentCount
+        - overall
+        - overallLabel
+        - sentiment
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          example: cmuyex8av0000wegjtsb6gq8d
+        name:
+          type: string
+          example: Metropolitan School Cairo
+        arabicName:
+          type: string
+          nullable: true
+          example: ميتروبوليتان سكول القاهرة
+        slug:
+          type: string
+          description: URL slug for the school page (`/schools/{slug}`).
+          example: metropolitan-school-cairo
+        location:
+          type: string
+          example: القاهرة الجديدة، التجمع الخامس
+        commentCount:
+          type: integer
+          minimum: 0
+          example: 20
+        overall:
+          type: string
+          enum: [mostly_positive, mixed, mostly_negative]
+          description: |
+            Classified from the sentiment split. `mostly_positive` when
+            positives exceed negatives by 1.5×, `mostly_negative` the reverse,
+            otherwise `mixed`.
+          example: mixed
+        overallLabel:
+          type: string
+          description: Arabic label for `overall`.
+          enum: ["إيجابي غالبًا", "آراء مختلطة", "سلبي غالبًا"]
+          example: آراء مختلطة
+        sentiment:
+          type: object
+          required: [positivePct, neutralPct, negativePct, total]
+          additionalProperties: false
+          properties:
+            positivePct:
+              type: integer
+              minimum: 0
+              maximum: 100
+              example: 45
+            neutralPct:
+              type: integer
+              minimum: 0
+              maximum: 100
+              example: 25
+            negativePct:
+              type: integer
+              minimum: 0
+              maximum: 100
+              example: 30
+            total:
+              type: integer
+              minimum: 0
+              description: Total comments the percentages are based on.
+              example: 20

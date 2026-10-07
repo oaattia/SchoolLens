@@ -1,0 +1,23 @@
+services:
+  schoollens:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: schoollens:latest
+    container_name: schoollens
+    restart: unless-stopped
+    ports:
+      # Host port -> container port. Change the left side if 3000 is taken
+      # on the Proxmox host/LXC, e.g. "8080:3000".
+      - "3000:3000"
+    environment:
+      # IMPORTANT: override this in production.
+      SCHOOLLENS_INTERNAL_API_KEY: ${SCHOOLLENS_INTERNAL_API_KEY:-dev-secret-change-me}
+      DATABASE_URL: file:/app/data/dev.db
+      NODE_ENV: production
+    volumes:
+      # Persistent SQLite database — comments survive container rebuilds.
+      - schoollens-data:/app/data
+
+volumes:
+  schoollens-data:
